@@ -1,7 +1,9 @@
 streamlit
 pandas
 openpyxl
+python-barcode
 python-docx
 barcode
 Pillow
 setuptools
+
