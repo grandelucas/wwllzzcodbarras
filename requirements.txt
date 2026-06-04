@@ -1,9 +1,8 @@
 streamlit
 pandas
 openpyxl
-python-barcode
 python-docx
-barcode
 Pillow
-setuptools
 
+python-barcode==0.15.1
+setuptools>=75.0.0
