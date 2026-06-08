@@ -7,111 +7,173 @@ from docx.shared import Inches
 from datetime import datetime
 import io
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ─────────────────────────────────────────────
 # Configuración de la página
+# ─────────────────────────────────────────────
 st.set_page_config(page_title="UNT - UGRE", layout="centered")
-
-# Título principal
 st.title("📦 UGRE – GENERAR CÓDIGO DE BARRAS PARA LIBROS")
 
-# Configuración personalizada del código de barras
+# ─────────────────────────────────────────────
+# Configuración del código de barras
+# ─────────────────────────────────────────────
 BARCODE_CONFIG = {
-    "module_height": 8.0,      # Altura reducida (por defecto 15.0)
-    "font_size": 4,            # Tamaño de letra reducido (por defecto 12)
-    "text_distance": 2.0,      # Distancia del texto al código
-    "quiet_zone": 2.5,         # Margen silencioso
+    "module_height": 8.0,
+    "font_size": 4,
+    "text_distance": 2.0,
+    "quiet_zone": 2.5,
 }
 
-def generar_codigo_barras(valor, idx):
-    """Genera imagen de código de barras con configuración personalizada"""
-    writer = ImageWriter()
-    
-    # Aplicar configuración personalizada
-    writer.set_options(BARCODE_CONFIG)
-    
-    code = Code128(valor, writer=writer)
-    filename = f"temp_barcode_{idx}"
-    fullpath = code.save(filename)
-    return fullpath
+# ─────────────────────────────────────────────
+# OPTIMIZACIÓN 1: Generación en memoria (sin I/O a disco)
+# ─────────────────────────────────────────────
+def generar_codigo_barras_en_memoria(valor: str) -> io.BytesIO | None:
+    """
+    Genera el código de barras directamente en un buffer en memoria.
+    Evita escribir/leer archivos temporales del disco (I/O más lento).
+    """
+    try:
+        writer = ImageWriter()
+        writer.set_options(BARCODE_CONFIG)
+        code = Code128(valor, writer=writer)
+        buffer = io.BytesIO()
+        code.write(buffer)
+        buffer.seek(0)
+        return buffer
+    except Exception:
+        return None
 
-# Subir archivo Excel
+# ─────────────────────────────────────────────
+# OPTIMIZACIÓN 2: Procesamiento paralelo con caché por sesión
+# ─────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def generar_todos_los_codigos(codigos: tuple) -> dict:
+    """
+    Genera todos los códigos de barras en paralelo usando ThreadPoolExecutor.
+    `st.cache_data` evita regenerarlos si el Excel no cambió.
+    Recibe una tuple (hashable) para que el caché funcione correctamente.
+    """
+    resultados = {}
+
+    def tarea(valor):
+        return valor, generar_codigo_barras_en_memoria(valor)
+
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+        futuros = {executor.submit(tarea, v): v for v in codigos}
+        for futuro in as_completed(futuros):
+            valor, buffer = futuro.result()
+            resultados[valor] = buffer
+
+    return resultados
+
+# ─────────────────────────────────────────────
+# OPTIMIZACIÓN 3: Construcción del Word en un solo paso (sin re-opens)
+# ─────────────────────────────────────────────
+def construir_documento_word(df: pd.DataFrame, imagenes: dict) -> io.BytesIO:
+    """
+    Arma el documento Word usando las imágenes ya generadas en memoria.
+    """
+    doc = Document()
+    doc.add_heading("Códigos de barras generados", level=1)
+
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Table Grid"
+    header_cells = table.rows[0].cells
+    header_cells[0].text = "SIGNATURA"
+    header_cells[1].text = "CÓDIGO DE BARRAS"
+
+    for _, row in df.iterrows():
+        signatura   = str(row["SIGNATURA"])
+        cod_barras  = str(row["CODIGO BARRAS"])
+        buffer      = imagenes.get(cod_barras)
+
+        row_cells = table.add_row().cells
+        row_cells[0].text = signatura
+
+        if buffer:
+            buffer.seek(0)
+            paragraph = row_cells[1].paragraphs[0]
+            run = paragraph.add_run()
+            run.add_picture(buffer, width=Inches(1.8))
+        else:
+            row_cells[1].text = "Error al generar"
+
+    doc_io = io.BytesIO()
+    doc.save(doc_io)
+    doc_io.seek(0)
+    return doc_io
+
+# ─────────────────────────────────────────────
+# UI principal
+# ─────────────────────────────────────────────
 uploaded_file = st.file_uploader("📂 Subir archivo Excel", type=["xlsx"])
 
 if uploaded_file is not None:
     df = pd.read_excel(uploaded_file)
 
-    # Verificar que existan las columnas necesarias
     if "CODIGO BARRAS" not in df.columns or "SIGNATURA" not in df.columns:
         st.error("⚠️ El archivo debe contener las columnas 'CODIGO BARRAS' y 'SIGNATURA'")
         st.stop()
 
-    st.success("✅ Archivo cargado correctamente")
+    st.success(f"✅ Archivo cargado — {len(df)} registros")
     st.dataframe(df.head())
 
-    # Botón para generar códigos de barras
     if st.button("🔲 GENERAR CÓDIGO DE BARRAS"):
-        with st.spinner("Generando códigos de barras..."):
-            # Crear documento Word
-            doc = Document()
-            doc.add_heading("Códigos de barras generados", level=1)
+        codigos_unicos = tuple(df["CODIGO BARRAS"].astype(str).unique())
+        total = len(df)
 
-            # Crear tabla de 2 columnas
-            table = doc.add_table(rows=1, cols=2)
-            table.style = 'Table Grid'
-            header_cells = table.rows[0].cells
-            header_cells[0].text = "SIGNATURA"
-            header_cells[1].text = "CÓDIGO DE BARRAS"
+        # ── Fase 1: generar imágenes en paralelo ──────────────────────────
+        with st.spinner(f"⚙️ Generando {len(codigos_unicos)} código(s) en paralelo…"):
+            imagenes = generar_todos_los_codigos(codigos_unicos)
 
-            temp_image_paths = []
+        # ── Fase 2: construir Word ────────────────────────────────────────
+        progreso = st.progress(0, text="📄 Armando documento Word…")
 
-            for idx, row in df.iterrows():
-                signatura = str(row["SIGNATURA"])
-                codigo_barras = str(row["CODIGO BARRAS"])
+        # Procesamos el df en chunks para actualizar la barra de progreso
+        doc = Document()
+        doc.add_heading("Códigos de barras generados", level=1)
+        table = doc.add_table(rows=1, cols=2)
+        table.style = "Table Grid"
+        hc = table.rows[0].cells
+        hc[0].text = "SIGNATURA"
+        hc[1].text = "CÓDIGO DE BARRAS"
 
-                # Generar imagen del código de barras
-                try:
-                    fullpath = generar_codigo_barras(codigo_barras, idx)
-                    temp_image_paths.append(fullpath)
+        for i, (_, row) in enumerate(df.iterrows()):
+            signatura  = str(row["SIGNATURA"])
+            cod_barras = str(row["CODIGO BARRAS"])
+            buffer     = imagenes.get(cod_barras)
 
-                    # Agregar fila a la tabla Word
-                    row_cells = table.add_row().cells
-                    row_cells[0].text = signatura
+            row_cells = table.add_row().cells
+            row_cells[0].text = signatura
 
-                    # Insertar imagen del código de barras
-                    paragraph = row_cells[1].paragraphs[0]
-                    run = paragraph.add_run()
-                    run.add_picture(fullpath, width=Inches(1.8))  # Ancho ligeramente reducido
+            if buffer:
+                buffer.seek(0)
+                paragraph = row_cells[1].paragraphs[0]
+                run = paragraph.add_run()
+                run.add_picture(buffer, width=Inches(1.8))
+            else:
+                row_cells[1].text = "Error al generar"
 
-                except Exception as e:
-                    st.warning(f"Error generando código para '{codigo_barras}': {e}")
-                    row_cells = table.add_row().cells
-                    row_cells[0].text = signatura
-                    row_cells[1].text = "Error al generar"
+            progreso.progress((i + 1) / total, text=f"📄 Fila {i+1} de {total}…")
 
-            # Guardar documento Word en memoria
-            doc_filename = f"COD_BAR_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
-            doc_io = io.BytesIO()
-            doc.save(doc_io)
-            doc_io.seek(0)
+        progreso.empty()
 
-            # Limpiar archivos temporales
-            for path in temp_image_paths:
-                try:
-                    os.remove(path)
-                except:
-                    pass
+        # ── Guardar en memoria ───────────────────────────────────────────
+        doc_filename = f"COD_BAR_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        doc_io = io.BytesIO()
+        doc.save(doc_io)
+        doc_io.seek(0)
 
-            # Guardar en session_state para descarga
-            st.session_state["doc_bytes"] = doc_io
-            st.session_state["doc_filename"] = doc_filename
+        st.session_state["doc_bytes"]    = doc_io
+        st.session_state["doc_filename"] = doc_filename
+        st.success("✅ ¡Códigos generados correctamente!")
 
-            st.success("✅ Códigos de barras generados correctamente")
-
-    # Botón de descarga
+    # ── Descarga ─────────────────────────────────────────────────────────
     if "doc_bytes" in st.session_state:
         st.download_button(
             label="📥 DESCARGAR ARCHIVO WORD",
             data=st.session_state["doc_bytes"],
             file_name=st.session_state["doc_filename"],
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
